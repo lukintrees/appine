@@ -218,6 +218,16 @@
 - **Watch out**: Direct callers of individual `ensure*` helpers still fail fast unless they pass `onFailure`, and unreadable one-time markers skip their migration instead of re-seeding user-deleted files.
 - **Source**: 12ac97cf, f7d164db
 
+### D48: Arch Linux ARM is a third distro, with a rootfs built from packages and pinned as a release asset
+
+- **What**: `Rootfs.Distro.ARCH` ("Arch Linux ARM") downloads `archlinuxarm-aarch64-minimal.tar.gz` from the fork's GitHub release, pinned by sha256 and length, and writes `/etc/pacman.d/mirrorlist` with `Server = <base>/$arch/$repo` lines, the probed mirror first and the rest after it. The tarball is built by `scripts/build-arch-rootfs`: `pacman --root` into a directory with `systemd` and `libmakepkg-dropins` assumed installed, the Arch Linux ARM keyring initialized under `qemu-aarch64-static`, no bind mounts, then systemd's units/sysusers/tmpfiles files, its NSS modules and its PAM modules removed, and the wheel and users groups and `/etc/os-release` written. `login.sh` selects the wheel group with sudo on `/etc/arch-release` and tests `$tool` rather than `$group = wheel`, so Arch does not take Alpine's addgroup/doas path; the bash and zsh rc hooks now cover every non-Alpine store.
+- **Why**: The official `ArchLinuxARM-aarch64-latest.tar.gz` cannot be pinned (no version, digest or length), weighs about 0.9 GB, ships systemd as init and has no `/etc/inittab`, which the kernel's boot parser reads. A rootfs built from packages is 86 MiB, verifiable by digest like Debian's, and boots the way Appine expects.
+- **Alternatives**: Ship the official tarball and strip it after import (no digest to verify before the import, and a 0.9 GB download); bundle the tarball in the APK like Alpine's (86 MiB more in every APK, for a distro most users never pick); install Arch with `pacstrap`/`arch-chroot` (needs a working init and mounts Appine cannot provide).
+- **Chosen**: Build the rootfs once with host `pacman --root`, publish it as a release asset of the fork, and pin its sha256 and length in `Distro.ARCH`, so the import path is identical to Debian's and the build is reproducible by `sudo scripts/build-arch-rootfs`.
+- **Tradeoffs**: The tarball is hosted by the fork rather than by the project, so a fork that disappears breaks the download (the pinned digest only guarantees that whatever arrives is the right file); and the build needs a host with `pacman` and `qemu-aarch64-static`, so it is not part of the normal build.
+- **Risks**: Guest programs cannot be exercised on x86_64 (Tier 0's SIMD stubs need an aarch64 host, so even Alpine's busybox dies with `SIGILL`), leaving on-device behaviour — pacman's sandboxing, sudo's setuid path, the PAM configuration after the systemd modules are removed — unverified; the rootfs is a rolling-release snapshot, so its pinned digest ages and a refresh means a new release asset and a new pin.
+- **Source**: e4e2da55
+
 ## Superseded
 
 - ~~The execution tier is chosen in Settings in every build (5c34951, round 190)~~ → replaced by **D10** in 62a8c07 (2026-11-04)

@@ -5,15 +5,15 @@
 >
 > Verified: 2026-11-26 (full mapping, 15 claims independently checked across package verification, store publication, per-start setup, OpenRC, account selection and shell integration)
 >
-> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: single-session `withStore` batching across `prepareStart`, `configure`, `updateProfile` and OpenRC staging, unchanged-file write skipping, and `openrc-setup-done` precheck)
+> Maintained: 2026-11-27 (targeted verification only since the full mapping; latest change: Arch Linux ARM as a third distro — pinned release tarball, pacman sources, login.sh's wheel/sudo branch, and the bash/zsh rc hooks now covering every non-Alpine store)
 
 ## Responsibilities
 
 `android/setup` provides the guest system and its account setup:
 
-- the distributions (Alpine from the APK, Debian downloaded), downloading and verifying tarballs,
-  importing them into a new store, and writing first-boot configuration, which on Alpine makes
-  bash the login shell;
+- the distributions (Alpine from the APK, Debian and Arch Linux ARM downloaded), downloading and
+  verifying tarballs, importing them into a new store, and writing first-boot configuration, which
+  on Alpine makes bash the login shell;
 - files refreshed before every kernel start (network interfaces, rootless podman's network, the
   bundled doas package, the profile script and the files of ash's, bash's and zsh's prompt marks for the
   terminal's shell integration), one-time OpenRC setup on Alpine, the osclock script run before boot and the boot log's failed services;
@@ -26,7 +26,8 @@
 Root: `android/app/src/main/java/io/github/mthli/appine/Rootfs.kt`,
 `android/app/src/main/assets/login.sh`, `android/app/src/main/assets/install-openrc.sh`, `android/app/src/main/assets/profile.sh`,
 `android/app/src/main/assets/ashrc.sh`, `android/app/src/main/assets/bashrc.sh`,
-`android/app/src/main/assets/zshrc.sh`, `android/app/src/main/assets/xdg-open.sh`, `android/app/src/main/assets/appine-gpu.sh`, `scripts/fetch-rootfs`.
+`android/app/src/main/assets/zshrc.sh`, `android/app/src/main/assets/xdg-open.sh`, `android/app/src/main/assets/appine-gpu.sh`, `scripts/fetch-rootfs`,
+`scripts/build-arch-rootfs`.
 
 Outside the module: the settings screen (`android/settings`); when imports, switches, restarts and
 logins happen, and the `settings` preferences (`android/service`); the import and
@@ -36,7 +37,7 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 
 ## Key types
 
-- `Rootfs` — object: `Distro` (`ALPINE`, `DEBIAN`: label, download, mirrors, probe path),
+- `Rootfs` — object: `Distro` (`ALPINE`, `DEBIAN`, `ARCH`: label, download, mirrors, probe path),
   `Download` (urls, sha256, size), `Cancelled` and the private `Oversize` (both `IOException`s),
   `Account` (name, uid, gid, home from `/etc/passwd`), `StartPreparation` (`browserReady`,
   `openRcDone`), internal `StoreAccess` (session read/write abstraction), `access` (a `ReentrantReadWriteLock`).
@@ -46,6 +47,12 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   - `DEBIAN`: "Debian 13"; one pinned GitHub URL (debuerreotype's `debian:trixie`) with fixed
     length and sha256; mirrors are host names (deb.debian.org, Tsinghua, USTC, Aliyun), probed at
     `debian/dists/trixie/InRelease` over https.
+  - `ARCH`: "Arch Linux ARM"; one pinned GitHub release asset of this fork
+    (`arch-rootfs-20261126/archlinuxarm-aarch64-minimal.tar.gz`, built by
+    `scripts/build-arch-rootfs`) with fixed length and sha256; mirrors are URLs ending in
+    `/archlinuxarm` (Tsinghua, USTC, Aliyun, Nanjing — the official host is left out because its
+    https certificate names `archlinuxarm.org` and its http redirects to a 404), probed at
+    `aarch64/core/core.db` over https.
   - The first mirror of each list is the official one: the importer uses it when no successful probe is ready.
 - Preferences: file `rootfs`, owned here (`distro`); the `settings` file is `android/service`'s
   `Settings`, displayed and edited through `android/settings`.
@@ -60,7 +67,7 @@ logins happen, and the `settings` preferences (`android/service`); the import an
 - `bashrc.sh` — copied verbatim into the guest as `/etc/profile.d/appine.bashrc`: bash's prompt
   marks (including `k=c` continuation marks on multi-line `PS1` and scalar/array `PROMPT_COMMAND`
   handling), read by the profile, by `/etc/bash/appine.sh` (`BASH_HOOK`) on Alpine, and via
-  `DEBIAN_BASH_HOOK` appended once to `/etc/bash.bashrc` on Debian.
+  `DEBIAN_BASH_HOOK` appended once to `/etc/bash.bashrc` on Debian and Arch.
 - `zshrc.sh` — copied verbatim into the guest as `/etc/profile.d/appine.zshrc`, read by the
   profile (on Alpine via `/etc/zsh/zprofile`, on Debian via `/etc/appine/zsh/.zshenv` written from
   `ZSHENV` and selected by `login.sh` via `ZDOTDIR`), and by `/etc/zsh/zshrc` (`ZSH_RC_HOOK`,
@@ -162,6 +169,11 @@ logins happen, and the `settings` preferences (`android/service`); the import an
     staged in `/var/cache/appine/procps/` by `cachePackages`, also used for bash and bubblewrap
     with libcap2 (`/var/cache/appine/bubblewrap/`). Existing stores do not receive these import-time files;
   - Debian: `hosts` and `resolv.conf` (the DNS stub) always.
+  - Arch: `hosts` only when absent (the rootfs ships one) and `resolv.conf` pointed at the DNS
+    stub. The rootfs is built by `scripts/build-arch-rootfs` and carries pacman with the Arch Linux
+    ARM keyring, bash, coreutils, util-linux, shadow, curl, gnupg and sudo; it has no systemd, so
+    wheel and users are written by the script and PAM's systemd modules are removed. Nothing is
+    staged from the APK.
 
 ### Before every start and boot
 
@@ -262,9 +274,9 @@ logins happen, and the `settings` preferences (`android/service`); the import an
     so a PS1 that `~/.bashrc` or anything later sets is wrapped from the next prompt on; a later
     plain assignment to `PROMPT_COMMAND` drops the function and with it every mark. On Alpine,
     `/etc/bash/bashrc` reads `/etc/bash/appine.sh`, hence `appine.bashrc`, in every interactive
-    bash; on Debian, `ensureShellRcHooks` appends `DEBIAN_BASH_HOOK` once to `/etc/bash.bashrc`
-    (gated by `/var/lib/appine/debian-bashrc-hook-done`), so a nested bash (`bash`, `su` without
-    `-l`) marks its own prompt on both distros;
+    bash; on Debian and Arch, `ensureShellRcHooks` appends `DEBIAN_BASH_HOOK` once to
+    `/etc/bash.bashrc` (gated by `/var/lib/appine/debian-bashrc-hook-done`), so a nested bash
+    (`bash`, `su` without `-l`) marks its own prompt on every distro;
   - busybox ash, which has no hook before a command or a prompt (1.37 has no `PROMPT_COMMAND`):
     PS1 itself carries D with `$?` (expanded at each prompt and redraw), A with `cl=line`, `P;k=c`
     with `appine_lf=output` after `\n` escapes in multi-line prompts, and after the prompt B (the
@@ -326,8 +338,10 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   5 s thresholds between reads. The import proceeds while these tasks run.
 - After local configuration, the importer chooses the highest completed successful speed, breaking
   ties in distro list order and falling back to the official mirror if no speed is available.
-  It writes Alpine's `main` and `community` to `/etc/apk/repositories`, or Debian's deb822
-  HTTP sources for trixie, updates and security to `/etc/apt/sources.list.d/debian.sources`.
+  It writes Alpine's `main` and `community` to `/etc/apk/repositories`, Debian's deb822
+  HTTP sources for trixie, updates and security to `/etc/apt/sources.list.d/debian.sources`, or
+  Arch's `/etc/pacman.d/mirrorlist` with `Server = <base>/$arch/$repo` lines, the selected mirror
+  first and the rest after it, since pacman walks the list in order.
 - The importer requests cancellation of outstanding probes before syncing and renaming the
   temporary store. Probe tasks only measure throughput. A ready store skips the entire import,
   so users can edit or remove sources in the guest.
@@ -344,8 +358,9 @@ logins happen, and the `settings` preferences (`android/service`); the import an
   in child processes) only around cancellable package-lock waits (`flock 9` in `locked`, `apk add
   --wait 3600`) and Debian `apt-get` update/sleep/install calls, and restores `trap - INT` right
   before `exec` into the user shell or `su`. It chooses wheel, doas and
-  `/etc/doas.d/30-appine.conf` on Alpine (`/etc/alpine-release`), else sudo, sudo and
-  `/etc/sudoers.d/appine`, picks the account, and:
+  `/etc/doas.d/30-appine.conf` on Alpine (`/etc/alpine-release`), wheel, sudo and
+  `/etc/sudoers.d/appine` on Arch Linux ARM (`/etc/arch-release`; Arch has no `addgroup`, so the
+  group is joined with `usermod`), else sudo, sudo and `/etc/sudoers.d/appine`, picks the account, and:
   - every login, root's included: rewrite the NOPASSWD rules for recorded admins still in the
     group that have no password: a shadow field that, after any leading `!`s, is empty or `*`
     (`adduser -D` writes `!`); `passwd -l`'s `!` before a hash still counts as a password, and so
@@ -385,12 +400,13 @@ logins happen, and the `settings` preferences (`android/service`); the import an
     install `/var/cache/appine/doas.apk` if `doas` is not on PATH, run `apk_add doas` if just
     installed or apk-managed (`apk info -e doas`, leaving a custom non-apk `doas` alone), and
     create the marker only after that succeeds (retrying partial installs while respecting later
-    user removal); on Debian (`/var/lib/appine/sudo-installed`), if `sudo` is not on PATH, install
-    it from the network showing apt's progress (Ctrl-C skips until the next login; no install lock:
-    `apt_update` retries `apt-get update` every 2 s while another apt holds the package lists' lock,
-    saying so once and showing other errors and warnings afterward, and `apt-get install` waits up
-    to an hour for dpkg's lock via `DPkg::Lock::Timeout`), then touch the marker once `sudo` is on
-    PATH;
+    user removal); on Debian and Arch (`/var/lib/appine/sudo-installed`), if `sudo` is not on PATH,
+    install it from the network showing apt's progress (Ctrl-C skips until the next login; no install
+    lock: `apt_update` retries `apt-get update` every 2 s while another apt holds the package lists'
+    lock, saying so once and showing other errors and warnings afterward, and `apt-get install` waits
+    up to an hour for dpkg's lock via `DPkg::Lock::Timeout`), then touch the marker once `sudo` is on
+    PATH. Arch ships sudo, so there `sudo` is always on PATH and the apt branch (gated on
+    `apt-get`) never runs: the marker is written at once;
   - the install lock: a `flock` on `/run/appine-install.lock` held around each install of a bundled
     package (`locked` runs `cancellable flock 9 && "$@"` so commands never run if acquiring the lock
     fails), so concurrent logins install bash, doas, procps-ng and bubblewrap one after another,
