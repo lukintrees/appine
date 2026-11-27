@@ -88,6 +88,36 @@ internal object Rootfs {
             ),
             "debian/dists/trixie/InRelease",
         ),
+
+        /**
+         * A minimal Arch Linux ARM built by `scripts/build-arch-rootfs`: pacman with the Arch Linux
+         * ARM keyring, bash, core utilities, sudo. Not the official
+         * `ArchLinuxARM-aarch64-latest.tar.gz`, which has no pinned digest, weighs about 0.9 GB and
+         * carries systemd and no `/etc/inittab` (the kernel's boot parser reads the latter).
+         * Appine hosts the tarball as a release asset. The mirrors are base URLs ending in
+         * `/archlinuxarm`, like Alpine's. The official host is left out: its https certificate
+         * names `archlinuxarm.org` rather than the `mirror.` host, and its http redirects to a
+         * 404. The four listed serve the same tree over https, so the packages' signatures are
+         * the only check that matters.
+         */
+        ARCH(
+            "Arch Linux ARM",
+            Download(
+                listOf(
+                    "https://github.com/lukintrees/appine/releases/download/" +
+                        "arch-rootfs-20261126/archlinuxarm-aarch64-minimal.tar.gz",
+                ),
+                "28a904b668ddd05de20deff533eb181df3e02b38888e5fb868111663fdd151e9",
+                90_074_215,
+            ),
+            listOf(
+                "https://mirrors.tuna.tsinghua.edu.cn/archlinuxarm",
+                "https://mirrors.ustc.edu.cn/archlinuxarm",
+                "https://mirrors.aliyun.com/archlinuxarm",
+                "https://mirrors.nju.edu.cn/archlinuxarm",
+            ),
+            "aarch64/core/core.db",
+        ),
     }
 
     /** Thrown when a download is aborted ([download]'s `cancelled` returns true). */
@@ -245,22 +275,37 @@ internal object Rootfs {
     @Throws(IOException::class)
     private fun configure(context: Context, access: StoreAccess, distro: Distro) {
         write(access, "/etc/hostname", "localhost\n")
-        if (distro == Distro.ALPINE) {
-            write(access, "/etc/hosts", "127.0.0.1\tlocalhost\n::1\tlocalhost\n", overwrite = false)
-            useBash(context, access)
-            cachePackages(context, access, "procps")
-            cachePackages(context, access, "bubblewrap")
-        } else {
-            // Debian's has no hosts, and resolv.conf points at 1.1.1.1. DNS must go through the
-            // kernel layer's stub (the kernel/net map) for the system's Private DNS and VPNs to
-            // take effect
-            write(access, "/etc/hosts", "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n")
-            write(access, "/etc/resolv.conf", "nameserver 127.0.0.53\n")
+        when (distro) {
+            Distro.ALPINE -> {
+                write(access, "/etc/hosts", "127.0.0.1\tlocalhost\n::1\tlocalhost\n", overwrite = false)
+                useBash(context, access)
+                cachePackages(context, access, "procps")
+                cachePackages(context, access, "bubblewrap")
+            }
+            Distro.ARCH -> {
+                // The rootfs ships a hosts file, and its resolv.conf was copied from the build
+                // host. DNS must go through the kernel layer's stub (the kernel/net map) for the
+                // system's Private DNS and VPNs to take effect
+                write(
+                    access, "/etc/hosts",
+                    "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n",
+                    overwrite = false,
+                )
+                write(access, "/etc/resolv.conf", "nameserver 127.0.0.53\n")
+            }
+            Distro.DEBIAN -> {
+                // Debian's has no hosts, and resolv.conf points at 1.1.1.1. DNS must go through the
+                // kernel layer's stub (the kernel/net map) for the system's Private DNS and VPNs to
+                // take effect
+                write(access, "/etc/hosts", "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n")
+                write(access, "/etc/resolv.conf", "nameserver 127.0.0.53\n")
+            }
         }
         writeProfile(access, distro) { asset(context, it) }
-        val (packages, install) = when (distro) {
-            Distro.ALPINE -> "apk" to "apk add"
-            Distro.DEBIAN -> "apt" to "apt install"
+        val (packages, refresh, search, install) = when (distro) {
+            Distro.ALPINE -> listOf("apk", "apk update", "apk search", "apk add")
+            Distro.DEBIAN -> listOf("apt", "apt update", "apt search", "apt install")
+            Distro.ARCH -> listOf("pacman", "pacman -Sy", "pacman -Ss", "pacman -S")
         }
         write(
             access, "/etc/motd",
@@ -269,13 +314,13 @@ internal object Rootfs {
             ${distro.label}, running on Android.
 
             Working with packages:
-            - Update index:     $packages update
-            - Search packages:  $packages search <package>
+            - Update index:     $refresh
+            - Search packages:  $search <package>
             - Install packages: $install <package>
             - Show help:        $packages --help
 
             For example, install Codex:
-            $packages update
+            $refresh
             $install nodejs npm
             npm install -g @openai/codex
 
@@ -305,6 +350,12 @@ internal object Rootfs {
             Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp
 
             """.trimIndent()
+        // The rootfs has the Arch Linux ARM keyring and ca-certificates, so https everywhere; `$arch`
+        // and `$repo` are pacman's own variables, expanded by it. Every mirror is written, the
+        // selected one first: pacman tries them in order
+        Distro.ARCH -> "/etc/pacman.d/mirrorlist" to
+            (listOf(mirror) + distro.mirrors.filter { it != mirror })
+                .joinToString("") { "Server = $it/${'$'}arch/${'$'}repo\n" }
     }
 
     /** Copies a bundle from the APK to the guest's package cache. */
@@ -386,8 +437,9 @@ internal object Rootfs {
      * `/etc/bash/appine.sh` on Alpine, whose `/etc/bash/bashrc` reads every `.sh` file in
      * `/etc/bash` in every interactive bash (a login one too, through
      * `/etc/profile.d/00-bashrc.sh`): bash's prompt marks for a nested bash, which reads no
-     * profile. On Debian, [ensureShellRcHooks] appends [DEBIAN_BASH_HOOK] to `/etc/bash.bashrc`
-     * once per store.
+     * profile. On Debian and Arch, [ensureShellRcHooks] appends [DEBIAN_BASH_HOOK] to
+     * `/etc/bash.bashrc` once per store: bash reads that file in every interactive shell, a nested
+     * one directly and a login one through `/etc/profile`.
      */
     private const val BASH_HOOK = """# Written by Appine beside /etc/profile.d/appine.sh, and replaced together with it: Alpine's
 # /etc/bash/bashrc reads this file in every interactive bash, so a nested bash (bash, su without
@@ -406,8 +458,9 @@ if [[ -o interactive ]] && [[ -r /etc/profile.d/appine.zshrc ]]; then . /etc/pro
     /**
      * `/etc/appine/zsh/.zshenv`, pointed to via `ZDOTDIR` by `login.sh` for login `zsh` sessions.
      * Unsets `ZDOTDIR` immediately so user startup files and child processes never see it, sources
-     * `~/.zshenv`, and on Debian (where `/etc/zsh/zprofile` does not read `/etc/profile`) sources
-     * `/etc/profile.d/appine.sh` in sh emulation for interactive login shells.
+     * `~/.zshenv`, and on a system whose `/etc/zsh/zprofile` does not read `/etc/profile` (Debian's
+     * does not; Alpine's and Arch's do) sources `/etc/profile.d/appine.sh` in sh emulation for
+     * interactive login shells.
      */
     private const val ZSHENV = """# Written by Appine beside /etc/profile.d/appine.sh, and replaced together with it.
 'builtin' 'unset' 'ZDOTDIR'
@@ -417,7 +470,7 @@ if [[ -o interactive ]] && [[ -r /etc/profile.d/appine.zshrc ]]; then . /etc/pro
 } always {
     if [[ -o 'interactive' ]]; then
         if [[ -o 'login' ]]; then
-            if [[ ! -f /etc/alpine-release ]] && [[ -r /etc/profile.d/appine.sh ]]; then
+            if [[ ! -f /etc/alpine-release ]] && [[ ! -f /etc/arch-release ]] && [[ -r /etc/profile.d/appine.sh ]]; then
                 'builtin' 'emulate' 'sh' '-c' '. /etc/profile.d/appine.sh'
             fi
         elif [[ -r /etc/profile.d/appine.zshrc ]]; then
@@ -451,7 +504,7 @@ if [[ -o interactive ]] && [[ -r /etc/profile.d/appine.zshrc ]]; then . /etc/pro
 
     /**
      * Installs interactive rc hooks once per store when the shell's own system rc file is present,
-     * so nested non-login bash (Debian) and zsh (Alpine/Debian, once zsh is installed) receive
+     * so nested non-login bash (Debian, Arch) and zsh (any distro, once zsh is installed) receive
      * prompt marks and titles without conflicting with package installation or re-adding hooks a
      * user removed.
      */
@@ -461,7 +514,7 @@ if [[ -o interactive ]] && [[ -r /etc/profile.d/appine.zshrc ]]; then . /etc/pro
         distro: Distro,
         onFailure: (String, IOException) -> Unit = FAIL_FAST,
     ) {
-        if (distro == Distro.DEBIAN && readMarker(access, DEBIAN_BASHRC_HOOK_DONE, onFailure) == false) {
+        if (distro != Distro.ALPINE && readMarker(access, DEBIAN_BASHRC_HOOK_DONE, onFailure) == false) {
             runSetupStep("/etc/bash.bashrc", onFailure) {
                 appendRcHook(access, "/etc/bash.bashrc", DEBIAN_BASHRC_HOOK_DONE, "/etc/profile.d/appine.bashrc", DEBIAN_BASH_HOOK)
             }
@@ -712,10 +765,13 @@ esac
         return mirror
     }
 
-    /** Starts throughput probes for an import. Debian lists host names and probes them over HTTPS. */
+    /**
+     * Starts throughput probes for an import. Debian lists host names and probes them over https;
+     * Alpine and Arch list full base URLs.
+     */
     fun probeMirrors(distro: Distro): Map<String, Future<Double?>> {
         val urls = distro.mirrors.map { mirror ->
-            val base = if (distro == Distro.ALPINE) mirror else "https://$mirror"
+            val base = if (distro == Distro.DEBIAN) "https://$mirror" else mirror
             "$base/${distro.probe}"
         }
         return distro.mirrors.zip(startProbes(urls)).toMap()

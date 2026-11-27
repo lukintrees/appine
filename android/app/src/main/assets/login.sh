@@ -8,7 +8,8 @@
 # When a regular user first becomes the login account, it is added to the admin group and the
 # privilege tool is installed, as Alpine's setup-user -a does: on Alpine the wheel group and doas
 # (the app bundles that package, so it installs offline too), on Debian the sudo group and sudo
-# (needs the network; if it cannot be installed, it is retried at every later login). Accounts added
+# (needs the network; if it cannot be installed, it is retried at every later login), on Arch Linux
+# ARM the wheel group and sudo (both already in the rootfs). Accounts added
 # to the group are recorded in /var/lib/appine/admins; if the user later takes one out of the group,
 # it is not added back. With a password set, escalating asks for the password, following the
 # distro's convention; without one (adduser -D) it does not ask. The rule is rewritten at every
@@ -78,6 +79,13 @@ if [ -f /etc/alpine-release ]; then
     wheel_conf=/etc/doas.d/20-wheel.conf
     stock_wheel_rule='permit persist :wheel'
     wheel_rule='permit persist setenv { ENV=/etc/profile.d/appine.ashrc } :wheel'
+elif [ -f /etc/arch-release ]; then
+    # Arch Linux ARM: the wheel group and sudo, both of which the rootfs ships. Arch has no
+    # addgroup, so ensure_admin uses usermod; sudo's stock file leaves `%wheel` commented out, so
+    # the rule goes to /etc/sudoers.d/appine like Debian's
+    group=wheel
+    tool=sudo
+    rules=/etc/sudoers.d/appine
 else
     group=sudo
     tool=sudo
@@ -228,7 +236,7 @@ ensure_admin() {
         umask "$old_umask"
         flock 9 || return 1
         grep -Fqsx -- "$user" "$admins" && return 0
-        if [ "$group" = wheel ]; then
+        if [ "$tool" = doas ]; then
             addgroup "$user" wheel
             mkdir -p /etc/doas.d
             if has_stock_wheel_rule || { [ ! -e "$wheel_conf" ] && [ ! -L "$wheel_conf" ]; }; then
@@ -238,7 +246,7 @@ ensure_admin() {
                 printf '%s\n' "$wheel_rule" >>"$wheel_conf"
             fi
         else
-            usermod -aG sudo "$user"
+            usermod -aG "$group" "$user"
         fi
         ingroup "$user" && mkdir -p "${admins%/*}" && printf '%s\n' "$user" >>"$admins" && fresh=1
     } 9>/run/appine-rules.lock
@@ -260,7 +268,7 @@ refresh_rules() (
     exec 9>/run/appine-rules.lock || exit 1
     flock 9 || exit 1
     # Upgrade an unmodified stock wheel rule so `doas -s` preserves busybox ash's ENV hook.
-    if [ "$group" = wheel ] && has_stock_wheel_rule; then
+    if [ "$tool" = doas ] && has_stock_wheel_rule; then
         write_wheel_rule
     fi
     nopass=
@@ -280,7 +288,7 @@ refresh_rules() (
         {
             echo "# Written by Appine at each login and when /etc changes: administrators without a password ($admins)."
             for u in $nopass; do
-                if [ "$group" = wheel ]; then
+                if [ "$tool" = doas ]; then
                     echo "permit nopass setenv { ENV=/etc/profile.d/appine.ashrc } $u"
                 else
                     echo "$u ALL=(ALL:ALL) NOPASSWD: ALL"
@@ -360,10 +368,11 @@ tried=
 interrupted=
 if [ ! -e "$installed" ]; then
     command -v "$tool" >/dev/null 2>&1 || tried=1
-    if [ "$group" = wheel ]; then
+    if [ "$tool" = doas ]; then
         locked install_doas
     else
-        if [ -n "$tried" ]; then
+        # Debian installs sudo from the network; Arch ships it, so a missing one there is left alone
+        if [ -n "$tried" ] && command -v apt-get >/dev/null 2>&1; then
             # Downloading the index and the package from the network takes a few minutes, so apt's
             # output (the progress) is shown as usual. Ctrl-C during the download interrupts apt-get and
             # skips installing this time; for the dpkg step apt starts a new session in a
