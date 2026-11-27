@@ -1,0 +1,242 @@
+#!/bin/sh
+# Builds a minimal Arch Linux ARM (aarch64) rootfs tarball for Appine (the android/setup map).
+#
+# The official ArchLinuxARM-aarch64-latest.tar.gz is not used: it has no pinned version, digest or
+# length, weighs about 0.9 GB, ships systemd as init and has no /etc/inittab, which the kernel's
+# boot parser reads. This builds the same kind of rootfs Appine imports from Alpine or Debian:
+# a small set of packages installed by pacman with `--root` into a directory (no chroot for the
+# install, so no bind mounts are needed), then the Arch Linux ARM keyring initialized under
+# qemu-aarch64-static, then the guest's own pacman configuration and mirror list.
+#
+# Requires root (pacman writes ownership), host pacman and qemu-aarch64-static with binfmt_misc
+# (qemu-user-static-binfmt on Arch, binfmt-support elsewhere). The tarball is written to
+# target/rootfs by default; its size and sha256 are printed last, for pinning in Rootfs.kt.
+#
+# Usage: scripts/build-arch-rootfs [work directory]
+#
+# Nothing is mounted: the chroot gets the device nodes it needs from mknod, and a work directory
+# that is a mount point, or has one inside, is refused before anything is deleted.
+set -eu
+
+arch=aarch64
+mirror=${ARCH_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn/archlinuxarm}
+work=${1:-${TMPDIR:-/var/tmp}/appine-arch-rootfs}
+root=$work/root
+root_out=$(cd "$(dirname "$0")/.." && pwd)/target/rootfs
+name=archlinuxarm-$arch-minimal.tar.gz
+
+# The packages of a usable system: pacman and the keyring (package signatures are checked with the
+# keyring at install), the shell and core utilities Appine's login script and profile use, the
+# privilege tool, and what curl and pacman need for HTTPS. systemd and libmakepkg-dropins are
+# assumed installed: pacman lists them as dependencies, but Appine boots from /etc/inittab and
+# never runs systemd, and makepkg is not part of a rootfs.
+packages="
+filesystem pacman pacman-mirrorlist archlinuxarm-keyring archlinux-keyring
+bash coreutils util-linux shadow procps-ng ncurses readline gawk grep sed findutils
+diffutils tar gzip xz zstd bzip2 curl ca-certificates-mozilla gnupg less which nano
+libcap attr acl tzdata iana-etc glibc sudo bubblewrap
+"
+
+# What is not unpacked: documentation, headers, static libraries, locales other than the C ones,
+# gir data, and the two large iana-etc files nothing reads (glibc's name lookups use
+# /etc/protocols and /etc/services from iana-etc, which stay).
+noextract="
+usr/share/doc/*
+usr/share/man/*
+usr/share/info/*
+usr/share/locale/*
+usr/share/gtk-doc/*
+usr/share/help/*
+usr/share/i18n/locales/*
+usr/share/gir-1.0/*
+usr/include/*
+usr/lib/pkgconfig/*
+usr/lib/*.a
+usr/lib/*.o
+usr/share/iana-etc/port-numbers.iana
+usr/share/iana-etc/protocols.iana
+"
+
+say() { printf '%s\n' "build-arch-rootfs: $*" >&2; }
+die() { say "$*"; exit 1; }
+
+[ "$(id -u)" = 0 ] || die "run as root (pacman writes file ownership)"
+command -v pacman >/dev/null || die "pacman not found"
+[ -x /usr/bin/qemu-$arch-static ] || die "qemu-$arch-static not found (qemu-user-static-binfmt)"
+[ -e /proc/sys/fs/binfmt_misc/qemu-$arch ] || die "binfmt_misc entry for qemu-$arch is missing"
+
+# A work directory with a mount point inside would make the deletion below cross into the host:
+# refuse it instead (an earlier build left a bind mount behind once).
+if [ -d "$work" ] && [ -n "$(findmnt -rn -o TARGET | grep -F -- "$work")" ]; then
+    die "$work contains a mount point; unmount it first"
+fi
+
+say "building in $work"
+rm -rf "$work"
+mkdir -p "$root/var/lib/pacman" "$work/pkg" "$root_out"
+
+cat >"$work/pacman.conf" <<EOF
+[options]
+Architecture = $arch
+SigLevel = Never
+NoExtract = $(printf '%s ' $noextract)
+
+[core]
+Server = $mirror/\$arch/\$repo
+
+[extra]
+Server = $mirror/\$arch/\$repo
+
+[alarm]
+Server = $mirror/\$arch/\$repo
+EOF
+
+# --assume-installed: see the package list above. --dbpath inside the root keeps the host's own
+# package database untouched.
+pacman_conf="--root $root --dbpath $root/var/lib/pacman --cachedir $work/pkg --config $work/pacman.conf"
+say "synchronizing the databases"
+pacman $pacman_conf -Syy --noconfirm >&2
+say "installing the packages"
+# shellcheck disable=SC2086
+pacman $pacman_conf --assume-installed systemd --assume-installed libmakepkg-dropins \
+    -S --noconfirm --needed $packages >&2
+
+# The chroot's device nodes, made rather than bind-mounted, so nothing outside the work directory
+# is ever reachable from it. gpg (pacman-key) needs /dev/null and /dev/urandom; the console and the
+# pseudo-terminal multiplexer are what login and a shell expect. The filesystem package ships
+# /dev/null as a placeholder regular file, which is replaced here.
+for node in "null c 1 3" "zero c 1 5" "full c 1 7" "random c 1 8" "urandom c 1 9" \
+    "tty c 5 0" "ptmx c 5 2" "console c 5 1"; do
+    set -- $node
+    rm -f "$root/dev/$1"
+    mknod -m 666 "$root/dev/$1" "$2" "$3" "$4"
+done
+mkdir -p "$root/dev/pts" "$root/dev/shm"
+chmod 1777 "$root/dev/shm"
+
+# The keyring: gpg under qemu, so pacman in the guest verifies package signatures.
+say "initializing the keyring (qemu)"
+chroot "$root" /usr/bin/pacman-key --init
+chroot "$root" /usr/bin/pacman-key --populate archlinuxarm
+
+# The guest's own pacman: the same options, but signatures required now that the keyring exists,
+# and a mirror list Appine rewrites to the fastest mirror at import.
+cat >"$root/etc/pacman.conf" <<'EOF'
+#
+# /etc/pacman.conf
+#
+[options]
+HoldPkg     = pacman glibc
+Architecture = aarch64
+ParallelDownloads = 5
+DisableSandbox
+SigLevel    = Required DatabaseOptional
+LocalFileSigLevel = Optional
+NoExtract   = usr/share/doc/* usr/share/man/* usr/share/info/* usr/share/locale/*
+NoExtract   = usr/share/gtk-doc/* usr/share/help/* usr/share/i18n/locales/*
+NoExtract   = usr/include/* usr/lib/pkgconfig/* usr/share/gir-1.0/*
+NoExtract   = usr/lib/*.a usr/lib/*.o
+NoExtract   = usr/share/iana-etc/port-numbers.iana usr/share/iana-etc/protocols.iana
+
+[core]
+Include = /etc/pacman.d/mirrorlist
+
+[extra]
+Include = /etc/pacman.d/mirrorlist
+
+[alarm]
+Include = /etc/pacman.d/mirrorlist
+EOF
+cat >"$root/etc/pacman.d/mirrorlist" <<'EOF'
+Server = https://mirrors.tuna.tsinghua.edu.cn/archlinuxarm/$arch/$repo
+Server = https://mirrors.ustc.edu.cn/archlinuxarm/$arch/$repo
+Server = https://mirrors.aliyun.com/archlinuxarm/$arch/$repo
+Server = https://mirrors.nju.edu.cn/archlinuxarm/$arch/$repo
+EOF
+
+# What the importer would otherwise have to write, and what a first boot needs: a hostname and a
+# resolver (Appine writes its own /etc/resolv.conf pointing at the DNS stub before every start).
+printf 'localhost\n' >"$root/etc/hostname"
+cp /etc/resolv.conf "$root/etc/resolv.conf"
+
+# The wheel and users groups and the /etc/os-release that systemd-sysusers and systemd-tmpfiles
+# create on a normal install: neither runs here (there is no systemd), and the filesystem package
+# ships only root. wheel is what login.sh's admin setup puts a user in (usermod needs the group to
+# exist) and what sudo's stock rule names; users is useradd's default group (GROUP=users in
+# /etc/default/useradd), without which a new account gets a warning; os-release is what programs
+# and scripts recognise Arch by. The ids are the ones Arch ends up with.
+grep -q '^wheel:' "$root/etc/group" || {
+    printf 'wheel:x:998:\n' >>"$root/etc/group"
+    printf 'wheel:!::\n' >>"$root/etc/gshadow"
+}
+grep -q '^users:' "$root/etc/group" || {
+    printf 'users:x:984:\n' >>"$root/etc/group"
+    printf 'users:!::\n' >>"$root/etc/gshadow"
+}
+ln -sfn ../usr/lib/os-release "$root/etc/os-release"
+
+# sudo's stock file keeps `%wheel ALL=(ALL:ALL) ALL` commented out; login.sh grants the rule to
+# accounts without a password in /etc/sudoers.d/appine instead, so wheel needs no edit. The
+# directory exists but must accept the file.
+mkdir -p "$root/etc/sudoers.d"
+
+# Arch's nsswitch.conf asks systemd's NSS modules for passwd, group, shadow, gshadow and hosts;
+# without systemd they fail at every lookup (slow, and a warning in some programs). The files
+# backend answers all of them here, and the DNS stub answers hosts (the kernel/net map).
+cat >"$root/etc/nsswitch.conf" <<'EOF'
+# Written by scripts/build-arch-rootfs: Appine runs no systemd, so the systemd NSS modules
+# (libnss_systemd, libnss_myhostname, libnss_resolve, libnss_mymachines) are not asked.
+passwd: files
+group: files
+shadow: files
+gshadow: files
+
+publickey: files
+
+hosts: files dns
+networks: files
+
+protocols: files
+services: files
+ethers: files
+rpc: files
+
+netgroup: files
+EOF
+# /etc/mtab points at /proc/self/mounts, as systemd-tmpfiles makes it; pacman refuses to install
+# without it ("could not determine cachedir mount point")
+ln -sfn ../proc/self/mounts "$root/etc/mtab"
+
+# The systemd unit and sysusers files are dead weight here: nothing reads them, and systemd's own
+# are what a reader might mistake for a working system.
+rm -rf "$root/usr/lib/systemd" "$root/usr/lib/sysusers.d" "$root/usr/lib/tmpfiles.d" \
+    "$root/usr/lib/udev"
+for m in systemd resolve myhostname mymachines; do
+    rm -f "$root/usr/lib/libnss_$m.so" "$root/usr/lib/libnss_$m.so.2"
+done
+
+# PAM's stock files call systemd's modules (pam_systemd_home for a per-user home, pam_systemd for
+# session tracking), which live in the systemd package and are not here: a login would fail with
+# "module is unknown". Those lines are the ones prefixed with `-` where pam_systemd_home appears
+# (optional) and the `optional` pam_systemd line; pam_unix does the work either way.
+for f in "$root"/etc/pam.d/*; do
+    [ -f "$f" ] || continue
+    sed -i -e '/pam_systemd_home\.so/d' -e '/pam_systemd\.so/d' "$f"
+done
+
+# /etc/motd would otherwise be the file the filesystem package ships; Appine writes its own at
+# import, and this one is what a terminal shows before that happens.
+rm -f "$root/etc/motd"
+
+# The build's own leftovers: the synchronized databases (the guest resynchronizes on first use),
+# the package cache and anything the hooks wrote into /var/log.
+rm -rf "$root/var/lib/pacman/sync" "$root/var/cache/pacman/pkg" "$root/var/log"/*
+
+say "packing $name"
+tar -C "$root" --numeric-owner --xattrs --xattrs-include='*' --acls \
+    --exclude='./dev/*' --exclude='./proc/*' --exclude='./sys/*' --exclude='./run/*' \
+    -czf "$root_out/$name" . 2>/dev/null
+
+say "rootfs: $root_out/$name"
+ls -l "$root_out/$name" >&2
+printf '%s  %s\n' "$(sha256sum "$root_out/$name" | cut -d' ' -f1)" "$name"
